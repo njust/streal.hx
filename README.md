@@ -2,7 +2,7 @@
 
 A [Helix](https://github.com/helix-editor/helix/) plugin to bookmark files and quickly switch between them using numbers. Every working directory (and [optionally](#configuration) every Git branch) has its own distinct list. Heavily inspired by [otavioschwanck/arrow.nvim](https://github.com/otavioschwanck/arrow.nvim).
 
-Feedback and ideas are very much welcome, feel free to [create a new issue](https://github.com/gllms/streal.hx/issues) and share your thoughts.
+Feedback and ideas are very much welcome, feel free to [create a new issue](https://github.com/njust/streal.hx/issues) and share your thoughts.
 
 > [!WARNING]  
 > Critical bugs and breaking changes may occur at any time, especially while this plugin is pre 1.0. Use at your own risk.
@@ -35,7 +35,7 @@ You can quickly edit the list by pressing <kbd>e</kbd>. This will open the Strea
 1. You can then install this plugin using the Forge package manager:
 
    ```sh
-   forge pkg install --git https://github.com/gllms/streal.hx.git
+   forge pkg install --git https://github.com/njust/streal.hx.git
    ```
 
 2. Add the following line to your `init.scm`:

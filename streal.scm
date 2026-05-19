@@ -2,14 +2,18 @@
 (require "helix/misc.scm")
 (require "helix/editor.scm")
 (require (prefix-in helix. "helix/commands.scm"))
+(require (prefix-in helix.static. "helix/static.scm"))
 
-(struct StrealState (paths mode branch) #:mutable)
+(struct Mark (num path line))
+(struct StrealState (marks mode branch) #:mutable)
+
+(define MAX-MARKS 9)
 
 (define keymap-help
-  '("s"      "Add / remove current file"
-    "1..9"   "Open file"
+  '("s"      "Add / remove current position"
+    "1..9"   "Jump to mark (or delete in d mode)"
     "Esc, q" "Close popup"
-    "C"      "Clear list"
+    "C"      "Clear all marks"
     "h"      "Open in horizontal split"
     "v"      "Open in vertical split"
     "d"      "Delete mode"
@@ -47,6 +51,15 @@
 (define (handle-error err)
   (set-error! (string-append "'streal':" (error-object-message err))))
 
+(define (split-first str delim-char)
+  (let loop ([chars (string->list str)] [before '()])
+    (cond
+      [(null? chars) (list str "")]
+      [(eqv? (car chars) delim-char)
+       (list (list->string (reverse before))
+             (list->string (cdr chars)))]
+      [else (loop (cdr chars) (cons (car chars) before))])))
+
 (define (get-git-branch)
   (begin
     (define result
@@ -83,26 +96,85 @@
                           (do ((x (read-char in) (read-char in)) (chars '() (cons x chars)))
                               ((eof-object? x) (list->string (reverse chars)))))))
 
-(define (get-paths branch)
+(define (parse-mark-line str num)
+  (let* ([trimmed (trim str)]
+         [parts (split-first trimmed #\space)]
+         [line-str (car parts)]
+         [path (cadr parts)]
+         [line-num (string->number line-str)])
+    (if (and line-num (> (string-length path) 0))
+        (Mark num (trim-current-directory path) line-num)
+        #false)))
+
+(define (format-mark-line mark)
+  (string-append (number->string (Mark-line mark)) " " (Mark-path mark)))
+
+(define (mark-for-num marks n)
+  (cond
+    [(null? marks) #false]
+    [(= (Mark-num (car marks)) n) (car marks)]
+    [else (mark-for-num (cdr marks) n)]))
+
+(define (insert-sorted marks new-mark)
+  (cond
+    [(null? marks) (list new-mark)]
+    [(< (Mark-num new-mark) (Mark-num (car marks)))
+     (cons new-mark marks)]
+    [else (cons (car marks) (insert-sorted (cdr marks) new-mark))]))
+
+(define (set-mark marks num path line)
+  (insert-sorted (filter (lambda (m) (not (= (Mark-num m) num))) marks)
+                 (Mark num path line)))
+
+(define (remove-mark marks num)
+  (filter (lambda (m) (not (= (Mark-num m) num))) marks))
+
+(define (next-available-num marks)
+  (let ([used (map Mark-num marks)])
+    (let loop ([n 1])
+      (cond
+        [(> n MAX-MARKS) #false]
+        [(member n used) (loop (+ n 1))]
+        [else n]))))
+
+(define (find-mark-at marks path line)
+  (cond
+    [(null? marks) #false]
+    [(and (string=? (Mark-path (car marks)) path)
+          (= (Mark-line (car marks)) line))
+     (car marks)]
+    [else (find-mark-at (cdr marks) path line)]))
+
+(define (get-marks branch)
   (let ([path (get-streal-file-path branch)])
     (if (is-file? path)
-        (~>> path
-             (read-file-as-string)
-             ((flip split-many) "\n")
-             (map (lambda (x) (trim-current-directory (trim x))))
-             (filter (lambda (x) (> (string-length x) 0))))
+        (let ([lines (split-many (read-file-as-string path) "\n")])
+          (let loop ([ls lines] [i 1] [marks '()])
+            (if (or (null? ls) (> i MAX-MARKS))
+                (reverse marks)
+                (let* ([line (trim (car ls))]
+                       [mark (if (> (string-length line) 0)
+                                 (parse-mark-line line i)
+                                 #false)])
+                  (loop (cdr ls) (+ i 1)
+                        (if mark (cons mark marks) marks))))))
         '())))
 
-(define (write-paths paths branch)
+(define (write-marks marks branch)
   (let* ([path (get-streal-file-path branch)]
-         [contents (~> paths (string-join "\n") (string-append "\n"))]
+         [max-num (if (empty? marks) 0 (apply max (map Mark-num marks)))]
+         [lines (map (lambda (i)
+                       (let ([m (mark-for-num marks (+ i 1))])
+                         (if m (format-mark-line m) "")))
+                     (range max-num))]
+         [contents (if (> (length lines) 0)
+                       (string-append (string-join lines "\n") "\n")
+                       "")]
          [directory (parent-name path)])
-    (when (is-file? path)
-      (delete-file! (get-streal-file-path branch)))
-    (unless (path-exists? (parent-name path))
-      (create-directory! (parent-name path)))
-    (unless (empty? paths)
-      (call-with-output-file path (lambda (in) (write-string contents in))))
+    (when (is-file? path) (delete-file! path))
+    (unless (path-exists? directory) (create-directory! directory))
+    (unless (empty? marks)
+      (call-with-output-file path (lambda (out) (write-string contents out))))
     (delete-empty-directories)))
 
 (define (directory-empty? path) (= (length (read-dir path)) 0))
@@ -116,35 +188,6 @@
         (for-each delete-directory! (filter directory-empty? (read-dir branch-path)))
         (when (directory-empty? branch-path)
           (delete-directory! branch-path))))))
-
-(define (remove-path paths path branch)
-  (write-paths (filter (lambda (x) (not (string=? path x))) paths) branch))
-
-(define (calculate-popup-area rect paths mode)
-  (let* ([rect-width (area-width rect)]
-         [rect-height (area-height rect)]
-         [width (min (if (eqv? mode 'help)
-                         (+ (apply max (map string-length keymap-help)) 11)
-                         (+ (if (> (length paths) 0)
-                                (max (apply max (map (lambda (x) (string-length x)) paths)) 8)
-                                9)
-                            6))
-                     (- rect-width 4))]
-         [height (min (if (eqv? mode 'help)
-                          (+ (/ (length keymap-help) 2) 2)
-                          (+ (max (length paths) 1) 2))
-                      (- rect-height 4))]
-         [x (ceiling (max 0 (- (ceiling (/ rect-width 2)) (floor (/ width 2)))))]
-         [y (ceiling (max 0 (- (ceiling (/ rect-height 2)) (floor (/ height 2)))))])
-    (area (- x 1) (- y 1) width height)))
-
-(define (calculate-text-area popup-area)
-  (let ([padding-x 2]
-        [padding-y 1])
-    (area (+ (area-x popup-area) padding-x)
-          (+ (area-y popup-area) padding-y)
-          (- (area-width popup-area) (* padding-x 2))
-          (- (area-height popup-area) (* padding-y 2)))))
 
 (define (shorten-paths paths)
   (let ([split-paths (map (lambda (x) (reverse (split-many x (path-separator)))) paths)])
@@ -165,7 +208,38 @@
              (string-join (reverse (vector->list result)) (path-separator))))
          split-paths)))
 
-(define (switch-or-open path mode)
+(define (mark-display-texts marks shortened-paths)
+  (map (lambda (m sp)
+         (string-append sp ":" (number->string (Mark-line m))))
+       marks shortened-paths))
+
+(define (calculate-popup-area rect marks display-texts mode)
+  (let* ([rect-width (area-width rect)]
+         [rect-height (area-height rect)]
+         [width (min (if (eqv? mode 'help)
+                         (+ (apply max (map string-length keymap-help)) 11)
+                         (+ (if (> (length marks) 0)
+                                (max (apply max (map string-length display-texts)) 8)
+                                9)
+                            6))
+                     (- rect-width 4))]
+         [height (min (if (eqv? mode 'help)
+                          (+ (/ (length keymap-help) 2) 2)
+                          (+ (max (length marks) 1) 2))
+                      (- rect-height 4))]
+         [x (ceiling (max 0 (- (ceiling (/ rect-width 2)) (floor (/ width 2)))))]
+         [y (ceiling (max 0 (- (ceiling (/ rect-height 2)) (floor (/ height 2)))))])
+    (area (- x 1) (- y 1) width height)))
+
+(define (calculate-text-area popup-area)
+  (let ([padding-x 2]
+        [padding-y 1])
+    (area (+ (area-x popup-area) padding-x)
+          (+ (area-y popup-area) padding-y)
+          (- (area-width popup-area) (* padding-x 2))
+          (- (area-height popup-area) (* padding-y 2)))))
+
+(define (switch-or-open path line mode)
   (let* ([doc-ids (editor-all-documents)]
          [path-hash (apply hash
                            (flatten (map (lambda (x)
@@ -178,17 +252,22 @@
     (when (eq? mode 'vertical)
       (helix.vsplit))
     (if path-doc-id
-        (editor-switch-action! path-doc-id (Action/Replace))
-        (helix.open path))))
+        (begin
+          (editor-switch-action! path-doc-id (Action/Replace))
+          (helix.goto-line line)
+          (helix.static.align_view_center))
+        (helix.open (string-append path ":" (number->string line))))))
 
 (define (render-streal state area buf)
   (let* ([mode (StrealState-mode state)]
-         [paths (StrealState-paths state)]
+         [marks (StrealState-marks state)]
+         [paths (map Mark-path marks)]
          [shortened-paths (shorten-paths paths)]
-         [streal-area (calculate-popup-area area shortened-paths mode)]
+         [display-texts (mark-display-texts marks shortened-paths)]
+         [streal-area (calculate-popup-area area marks display-texts mode)]
          [text-area (calculate-text-area streal-area)]
          [popup-style (theme-scope "ui.popup")]
-         [active-style (theme-scope "ui.text.focus")]
+         [mode-style (theme-scope "ui.text.focus")]
          [number-style (theme-scope "markup.list")]
          [delete-style (theme-scope "error")])
     (buffer/clear buf streal-area)
@@ -198,7 +277,7 @@
                          (+ (area-x streal-area) 2)
                          (area-y streal-area)
                          (symbol->string mode)
-                         active-style))
+                         mode-style))
     (if (eqv? mode 'help)
         (for-each
          (lambda (i)
@@ -212,32 +291,29 @@
                                 popup-style)))
          (range (/ (length keymap-help) 2)))
         (begin
-          (when (= (length paths) 0)
+          (when (= (length marks) 0)
             (frame-set-string! buf (area-x text-area) (area-y text-area) "  (empty)" popup-style))
           (for-each (lambda (i)
-                      (let* ([path (list-ref paths i)]
-                             [shortened-path (list-ref shortened-paths i)]
-                             [current-style (cond
-                                              [(eqv? mode 'delete) delete-style]
-                                              [(string=? (trim-current-directory (editor-focus-path))
-                                                         (trim-current-directory path))
-                                               active-style]
-                                              [else popup-style])])
+                      (let* ([mark (list-ref marks i)]
+                             [display-text (list-ref display-texts i)]
+                             [current-style (if (eqv? mode 'delete)
+                                                  delete-style
+                                                  popup-style)])
                         (frame-set-string! buf
                                            (area-x text-area)
                                            (+ (area-y text-area) i)
-                                           (number->string (+ i 1))
+                                           (number->string (Mark-num mark))
                                            number-style)
                         (frame-set-string! buf
                                            (+ (area-x text-area) 2)
                                            (+ (area-y text-area) i)
-                                           shortened-path
+                                           display-text
                                            current-style)))
-                    (range (length paths)))))))
+                    (range (length marks)))))))
 
 (define (handle-event state event)
   (let* ([mode (StrealState-mode state)]
-         [paths (StrealState-paths state)]
+         [marks (StrealState-marks state)]
          [branch (StrealState-branch state)]
          [char (key-event-char event)]
          [num (char->number (or char #\null))]
@@ -250,36 +326,41 @@
        [(key-event-escape? event) event-result/close]
        [(eqv? char #\q) event-result/close]
        [(not (eqv? num #false))
-        (if (and (>= num 1) (<= num (length paths)))
-            (let ([selected-path (list-ref paths (- num 1))])
+        (let ([mark (mark-for-num marks num)])
+          (if mark
               (if (eqv? mode 'delete)
                   (begin
-                    (remove-path paths selected-path branch)
-                    (set-StrealState-paths! state (get-paths branch))
-                    (set-status! (string-append "'" selected-path "' removed from Streal file."))
+                    (write-marks (remove-mark marks (Mark-num mark)) branch)
+                    (set-StrealState-marks! state (get-marks branch))
+                    (set-status! (string-append "Mark " (number->string num) " removed."))
                     event-result/consume)
                   (begin
-                    (switch-or-open selected-path mode)
-                    event-result/close)))
-            (error (string-append "No path at index " (number->string num) ".")))]
+                    (switch-or-open (Mark-path mark) (Mark-line mark) mode)
+                    event-result/close))
+              (error (string-append "No mark at " (number->string num) "."))))]
        [(eqv? char #\s)
         (if (string=? current-path "")
-            (error "Can't add to Streal file with no path set.")
-            (begin
-              (if (member current-path paths)
+            (error "Can't add mark with no file open.")
+            (let* ([current-line (helix.static.get-current-line-number)]
+                   [existing (find-mark-at marks current-path current-line)])
+              (if existing
                   (begin
-                    (remove-path paths current-path branch)
-                    (set-status! (string-append "'" current-path "' removed from Streal file.")))
-                  (begin
-                    (write-paths (append paths (list current-path)) branch)
-                    (set-status! (string-append "'" current-path "' added to Streal file."))))
+                    (write-marks (remove-mark marks (Mark-num existing)) branch)
+                    (set-status! (string-append "Mark " (number->string (Mark-num existing)) " removed.")))
+                  (let ([num (next-available-num marks)])
+                    (if num
+                        (begin
+                          (write-marks (set-mark marks num current-path current-line) branch)
+                          (set-status! (string-append "Mark " (number->string num) " set: "
+                                                      current-path ":" (number->string current-line))))
+                        (error "All mark slots are full."))))
               event-result/close))]
        [(eqv? char #\e)
-        (switch-or-open (get-streal-file-path branch) mode)
+        (switch-or-open (get-streal-file-path branch) 1 mode)
         event-result/close]
        [(eqv? char #\C)
-        (write-paths '() branch)
-        (set-status! "Streal file cleared.")
+        (write-marks '() branch)
+        (set-status! "All marks cleared.")
         event-result/close]
        [(eqv? char #\d)
         (toggle-mode state 'delete)
@@ -296,20 +377,55 @@
        [(eqv? char #\:) event-result/ignore]
        [else event-result/consume]))))
 
+(define (validate-flag flag)
+  (when (and (not (string=? flag "")) (not (string=? flag "--per-branch")))
+    (error (string-append "unknown flag '" flag "'"))))
+
+(define (flag->branch flag)
+  (validate-flag flag)
+  (if (string=? flag "--per-branch") (get-git-branch) #false))
+
 ;;@doc
-;; Open the Streal popup
+;; Open the Streal popup showing all numbered marks
 ;; Flags:
 ;;   --per-branch  Keep a separate Streal file per Git branch
 (define (streal-open [flag ""])
   (with-handler handle-error
-                (if (and (not (string=? flag "")) (not (string=? flag "--per-branch")))
-                    (error (string-append "unknown flag '" flag "'"))
-                    (let ([branch (if (string=? flag "--per-branch")
-                                      (get-git-branch)
-                                      #false)])
-                      (push-component! (new-component! "streal"
-                                                       (StrealState (get-paths branch) 'normal branch)
-                                                       render-streal
-                                                       (hash "handle_event" handle-event)))))))
+                (let ([branch (flag->branch flag)])
+                  (push-component! (new-component! "streal"
+                                                   (StrealState (get-marks branch) 'normal branch)
+                                                   render-streal
+                                                   (hash "handle_event" handle-event))))))
 
-(provide streal-open)
+;;@doc
+;; Set a numbered mark (1-9) at the current cursor position
+;; Usage: :streal-mark <number> [--per-branch]
+(define (streal-mark num [flag ""])
+  (with-handler handle-error
+                (let* ([branch (flag->branch flag)]
+                       [marks (get-marks branch)]
+                       [current-path (trim-current-directory (editor-focus-path))]
+                       [current-line (helix.static.get-current-line-number)]
+                       [n (string->number num)])
+                  (if (and n (>= n 1) (<= n MAX-MARKS))
+                      (begin
+                        (write-marks (set-mark marks n current-path current-line) branch)
+                        (set-status! (string-append "Mark " (number->string n) " set: "
+                                                    current-path ":" (number->string current-line))))
+                      (error (string-append "Mark number must be between 1 and " (number->string MAX-MARKS) "."))))))
+
+;;@doc
+;; Jump to a numbered mark (1-9)
+;; Usage: :streal-goto <number> [--per-branch]
+(define (streal-goto num [flag ""])
+  (with-handler handle-error
+                (let* ([branch (flag->branch flag)]
+                       [marks (get-marks branch)]
+                       [n (string->number num)]
+                       [mark (if n (mark-for-num marks n) #false)])
+                  (cond
+                    [(not n) (error "Invalid mark number.")]
+                    [(not mark) (error (string-append "No mark at " num "."))]
+                    [else (switch-or-open (Mark-path mark) (Mark-line mark) 'normal)]))))
+
+(provide streal-open streal-mark streal-goto)
